@@ -40,8 +40,8 @@ ollama pull qwen3.5:9b
 if errorlevel 1 goto :falha
 
 echo [4/4] Baixando o modelo de transcricao de audio...
-echo Usado apenas em videos sem legenda. Ocupa cerca de 1,5 GB.
-python -c "from faster_whisper import WhisperModel; WhisperModel('medium', device='cpu', compute_type='int8')"
+echo Usado apenas em videos sem legenda. Ocupa cerca de 500 MB.
+python -c "from faster_whisper import WhisperModel; WhisperModel('small', device='cpu', compute_type='int8')"
 if errorlevel 1 (
   echo Aviso: o modelo de audio nao foi baixado agora.
   echo Ele sera baixado automaticamente no primeiro video sem legenda.
@@ -50,6 +50,10 @@ if errorlevel 1 (
 echo.
 echo Instalacao concluida.
 echo Agora use o arquivo ABRIR_APP.bat.
+echo.
+echo Se quiser usar o motor "Claude" (API da Anthropic) em vez do modelo
+echo local, cole sua chave no campo "Chave API Claude" da interface, ou
+echo defina a variavel de ambiente ANTHROPIC_API_KEY no Windows.
 pause
 exit /b 0
 

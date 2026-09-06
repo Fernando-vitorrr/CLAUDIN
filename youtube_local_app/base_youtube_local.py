@@ -14,12 +14,14 @@ Uso:
 """
 
 import argparse
+import gc
 import json
 import os
 import re
 import shutil
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -42,19 +44,42 @@ BASE_DIR = Path(
     )
 )
 
-MODELO = os.environ.get("YTBASE_MODEL", "qwen3.5:9b")
+# Motor de analise da transcricao:
+# - "ollama": modelo local via Ollama. Gratis, mas usa RAM/CPU do computador
+#   e e sensivelmente mais lento em notebook sem placa de video dedicada.
+# - "claude": API da Anthropic. Paga por token, mas nao usa RAM local e e
+#   muito mais rapida; para uma transcricao deste tamanho o custo tipico e de
+#   poucos centavos de dolar por video.
+# A transcricao (legenda ou Whisper) roda sempre local, nos dois casos; so a
+# analise/redacao da nota muda de lugar.
+MOTOR = os.environ.get("YTBASE_MOTOR", "ollama")
+
+MODELOS_OLLAMA = {
+    "qwen3.5:4b": 8_192,
+    "qwen3.5:9b": 16_384,
+    "qwen3.5:27b": 32_768,
+}
+# Contexto grande e deliberado: ao contrario do modelo local, a API cobra por
+# token realmente enviado, entao nao ha por que fatiar a transcricao a nao
+# ser que ela mesma seja enorme (a maioria dos videos cabe numa unica chamada).
+MODELOS_CLAUDE = {
+    "claude-haiku-4-5-20251001": 190_000,
+    "claude-sonnet-5": 190_000,
+    "claude-opus-5": 190_000,
+}
+MODELO_PADRAO_POR_MOTOR = {"ollama": "qwen3.5:9b", "claude": "claude-haiku-4-5-20251001"}
+
+MODELO = os.environ.get("YTBASE_MODEL", MODELO_PADRAO_POR_MOTOR.get(MOTOR, "qwen3.5:9b"))
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434").rstrip("/")
+ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 # Janela de contexto, em tokens.
 # O Ollama NAO usa a janela cheia do modelo por padrao: sem este valor ele roda
 # com poucos milhares de tokens e corta o excedente em silencio, produzindo uma
 # nota bem formatada baseada em parte do video.
 # A janela consome RAM alem do proprio modelo, por isso vem amarrada ao modelo.
-CONTEXTO_POR_MODELO = {
-    "qwen3.5:4b": 8_192,
-    "qwen3.5:9b": 16_384,
-    "qwen3.5:27b": 32_768,
-}
+CONTEXTO_POR_MODELO = {**MODELOS_OLLAMA, **MODELOS_CLAUDE}
 CONTEXTO_PADRAO = 16_384
 
 
@@ -74,12 +99,28 @@ MARGEM = 0.85
 # anterior evita perder raciocinio cortado na fronteira.
 SOBREPOSICAO_CHARS = 1_500
 
-# Modelo do faster-whisper usado quando o video nao tem legenda.
-# Alternativas mais rapidas e menos precisas: "small", "base".
-MODELO_WHISPER = os.environ.get("YTBASE_WHISPER", "medium")
+# Modelo do faster-whisper usado quando o video nao tem legenda. "small" e o
+# padrao: em CPU de notebook fica bem mais rapido que "medium" com perda de
+# qualidade pequena. Use "medium" so quando a transcricao do small sair ruim.
+MODELO_WHISPER = os.environ.get("YTBASE_WHISPER", "small")
+
+# Dica de idioma para o Whisper: pula a deteccao automatica (mais rapida e
+# mais confiavel) quando o idioma predominante da base ja e conhecido. Deixe
+# a variavel de ambiente vazia para voltar a deteccao automatica.
+WHISPER_IDIOMA = os.environ.get("YTBASE_WHISPER_IDIOMA", "pt") or None
+
+# Feixe de busca da decodificacao. beam_size=1 (greedy) e bem mais rapido que
+# o padrao da biblioteca (5), com perda de qualidade pequena para este uso.
+WHISPER_BEAM = int(os.environ.get("YTBASE_WHISPER_BEAM", "1"))
 
 # Ordem de preferencia das legendas.
 IDIOMAS_LEGENDA = ["pt", "pt-BR", "pt-orig", "en", "en-US", "en-orig"]
+
+# Teto de tokens de cada nota INTERMEDIARIA (uma por trecho do video, antes da
+# sintese final). Notas intermediarias sao descartadas assim que a nota final
+# e gerada, entao gerar mais do que o necessario para registrar o trecho e so
+# custo de tempo (e, na API, de dinheiro) — nao sobra na nota que fica.
+TETO_PARTE_MAX = max(600, int(os.environ.get("YTBASE_TETO_PARTE", "900")))
 
 # Quantas notas anteriores entram como contexto do cruzamento.
 NOTAS_DE_CONTEXTO = 8
@@ -225,32 +266,40 @@ def metadados(url: str) -> dict:
 
 
 def baixar_legenda(url: str, tmp: Path):
-    """Devolve o caminho do .vtt preferido, ou None."""
-    opts = {
-        "skip_download": True,
-        "writesubtitles": True,
-        "writeautomaticsub": True,
-        "subtitleslangs": IDIOMAS_LEGENDA,
-        "subtitlesformat": "vtt",
-        "outtmpl": str(tmp / "%(id)s.%(ext)s"),
-        "quiet": True,
-        "no_warnings": True,
-    }
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([url])
-    except Exception as e:
-        print(f"  aviso: falha ao baixar legenda ({e})")
-        return None
+    """Devolve o caminho do .vtt do primeiro idioma disponivel, na ordem de
+    IDIOMAS_LEGENDA, ou None se nenhum idioma tiver legenda.
 
-    arquivos = list(tmp.glob("*.vtt"))
-    if not arquivos:
-        return None
+    Pede um idioma de cada vez, em vez de todos de uma vez so: alem de parar
+    assim que acha uma legenda utilizavel, evita que uma falha num idioma que
+    nem interessava (por exemplo HTTP 429 do YouTube ao tentar "en" depois de
+    "pt" ja ter sido baixado com sucesso) descarte em silencio o que ja tinha
+    funcionado e jogue o video inteiro para o Whisper sem necessidade.
+    """
     for idioma in IDIOMAS_LEGENDA:
-        for arq in arquivos:
-            if f".{idioma}." in arq.name:
-                return arq
-    return arquivos[0]
+        opts = {
+            "skip_download": True,
+            "writesubtitles": True,
+            "writeautomaticsub": True,
+            "subtitleslangs": [idioma],
+            "subtitlesformat": "vtt",
+            "outtmpl": str(tmp / "%(id)s.%(ext)s"),
+            "quiet": True,
+            "no_warnings": True,
+        }
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([url])
+        except Exception as e:
+            print(f"  aviso: falha ao baixar legenda em {idioma} ({e})")
+            continue
+
+        arquivos = list(tmp.glob("*.vtt"))
+        if arquivos:
+            for arq in arquivos:
+                if f".{idioma}." in arq.name:
+                    return arq
+            return arquivos[0]
+    return None
 
 
 def parse_vtt(caminho: Path):
@@ -303,8 +352,19 @@ def transcrever_audio(url: str, tmp: Path):
     print(f"  transcrevendo com Whisper ({MODELO_WHISPER}); pode demorar bastante...")
     print("  na primeira execucao o modelo e baixado, o que leva alguns minutos.")
     modelo = WhisperModel(MODELO_WHISPER, device="cpu", compute_type="int8")
-    trechos, _ = modelo.transcribe(str(audios[0]), language=None, vad_filter=True)
-    return [(int(t.start), t.text.strip()) for t in trechos if t.text.strip()]
+    trechos, _ = modelo.transcribe(
+        str(audios[0]),
+        language=WHISPER_IDIOMA,
+        beam_size=WHISPER_BEAM,
+        vad_filter=True,
+    )
+    resultado = [(int(t.start), t.text.strip()) for t in trechos if t.text.strip()]
+    # O Whisper e a analise (Ollama/Claude) nunca precisam estar na RAM ao
+    # mesmo tempo: libera explicitamente em vez de esperar o coletor de lixo
+    # decidir sozinho, ja que o proximo passo pesado comeca logo em seguida.
+    del modelo
+    gc.collect()
+    return resultado
 
 
 def montar_transcricao(segmentos, passo=45) -> str:
@@ -366,18 +426,25 @@ def estimar_tokens(texto: str) -> int:
 
 
 def chamar(prompt: str, max_tokens: int = 0) -> str:
-    """Envia o prompt ao Ollama local. Nenhum conteudo sai do computador."""
+    """Envia o prompt ao motor de analise configurado (Ollama local ou API da
+    Anthropic). Com o motor "ollama" nenhum conteudo sai do computador."""
     max_tokens = max_tokens or resposta_max()
     util = int(CONTEXTO * MARGEM)
     entrada = estimar_tokens(prompt) + estimar_tokens(SISTEMA)
     if entrada + max_tokens > util:
-        # Interrompe em vez de avisar: o Ollama truncaria o excedente em
+        # Interrompe em vez de avisar: o modelo truncaria o excedente em
         # silencio e a nota sairia completa na aparencia, parcial no conteudo.
         raise RuntimeError(
             f"prompt de ~{entrada:,} tokens mais {max_tokens:,} de resposta excedem "
             f"a area util de {util:,} tokens (janela de {CONTEXTO:,}). "
             "Use um modelo com janela maior ou processe o video em trechos."
         )
+    if MOTOR == "claude":
+        return _chamar_claude(prompt, max_tokens)
+    return _chamar_ollama(prompt, max_tokens)
+
+
+def _chamar_ollama(prompt: str, max_tokens: int) -> str:
     payload = json.dumps(
         {
             "model": MODELO,
@@ -412,6 +479,72 @@ def chamar(prompt: str, max_tokens: int = 0) -> str:
     if not conteudo:
         raise RuntimeError(f"O Ollama nao devolveu texto: {dados}")
     return conteudo
+
+
+def _chamar_claude(prompt: str, max_tokens: int) -> str:
+    if not ANTHROPIC_API_KEY:
+        raise RuntimeError(
+            "Motor 'claude' selecionado, mas a variavel de ambiente "
+            "ANTHROPIC_API_KEY nao esta definida. Defina-a com sua chave da "
+            "API da Anthropic (https://console.anthropic.com/)."
+        )
+    payload = json.dumps(
+        {
+            "model": MODELO,
+            "max_tokens": max_tokens,
+            "temperature": 0.2,
+            "system": SISTEMA,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+    ).encode("utf-8")
+    requisicao = urllib.request.Request(
+        ANTHROPIC_URL,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(requisicao, timeout=600) as resposta:
+            dados = json.loads(resposta.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detalhe = exc.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(f"erro {exc.code} da API da Anthropic: {detalhe}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(
+            "Nao foi possivel conectar a API da Anthropic. Verifique a internet."
+        ) from exc
+    blocos = dados.get("content") or []
+    conteudo = "".join(
+        b.get("text", "") for b in blocos if b.get("type") == "text"
+    ).strip()
+    if not conteudo:
+        raise RuntimeError(f"a API da Anthropic nao devolveu texto: {dados}")
+    return conteudo
+
+
+def descarregar_modelo_ollama():
+    """Pede ao Ollama para liberar o modelo da RAM assim que este processo
+    termina, em vez de deixa-lo ocupando memoria ate o timeout ocioso padrao
+    (alguns minutos) expirar sozinho."""
+    if MOTOR != "ollama":
+        return
+    try:
+        payload = json.dumps({"model": MODELO, "messages": [], "keep_alive": 0}).encode(
+            "utf-8"
+        )
+        requisicao = urllib.request.Request(
+            f"{OLLAMA_URL}/api/chat",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(requisicao, timeout=30)
+    except Exception:
+        pass  # liberar RAM aqui e um bonus; falha nao deve manchar o resumo final
 
 
 MARCADOR = re.compile(r"(?=\n\n\[\d{2}:\d{2}:\d{2}\] )")
@@ -487,7 +620,10 @@ def gerar_nota(meta: dict, transcricao: str, contexto: str) -> str:
             max(4_000, limite_chars - SOBREPOSICAO_CHARS),
             SOBREPOSICAO_CHARS,
         )
-        teto = max(600, int(entrada_max * 0.9) // len(partes))
+        # Nota intermediaria e descartada assim que a sintese final sai; dar a
+        # ela mais espaco do que TETO_PARTE_MAX so custaria tempo (e dinheiro,
+        # na API) sem sobrar nada na nota que fica.
+        teto = min(TETO_PARTE_MAX, max(600, int(entrada_max * 0.9) // len(partes)))
         palavras = max(250, int(teto / 1.8))
         print(
             f"  transcricao longa; {len(partes)} partes de ate {teto:,} tokens cada"
@@ -649,13 +785,23 @@ def verificar_ambiente() -> bool:
     ok = True
     print(f"Python: {sys.version.split()[0]}")
     print(f"Base: {BASE_DIR}")
+    print(f"Motor de analise: {MOTOR}")
     print(f"Contexto: {CONTEXTO:,} tokens")
     try:
         import faster_whisper  # noqa: F401
 
-        print("faster-whisper: instalado (usado so em video sem legenda)")
+        print(f"faster-whisper: instalado (modelo '{MODELO_WHISPER}', usado so em video sem legenda)")
     except ImportError:
         print("faster-whisper: ausente. Video sem legenda nao sera transcrito.")
+
+    if MOTOR == "claude":
+        if ANTHROPIC_API_KEY:
+            print(f"Claude API: chave configurada. Modelo: {MODELO}")
+        else:
+            print("Claude API: variavel ANTHROPIC_API_KEY nao definida.")
+            ok = False
+        return ok
+
     try:
         with urllib.request.urlopen(f"{OLLAMA_URL}/api/tags", timeout=10) as resposta:
             dados = json.loads(resposta.read().decode("utf-8"))
@@ -704,6 +850,8 @@ def expandir(url: str):
 def processar(url: str, forcar: bool) -> str:
     """Devolve 'concluido', 'ignorado' ou levanta excecao."""
     print(f"\n> {url}")
+    inicio_total = time.perf_counter()
+    tempos = {"legenda": 0.0, "whisper": 0.0, "analise": 0.0, "gravacao": 0.0}
     meta = metadados(url)
     print(f"  {meta['titulo']} ({fmt_tempo(meta['duracao'])})")
 
@@ -714,14 +862,18 @@ def processar(url: str, forcar: bool) -> str:
 
     tmp = Path(tempfile.mkdtemp())
     try:
+        t0 = time.perf_counter()
         legenda = baixar_legenda(url, tmp)
+        tempos["legenda"] = time.perf_counter() - t0
         if legenda:
             print(f"  legenda encontrada: {legenda.name}")
             segmentos = parse_vtt(legenda)
             origem = f"legenda {legenda.name.split('.')[-2]}"
         else:
             print("  sem legenda disponivel; caindo para o audio")
+            t0 = time.perf_counter()
             segmentos = transcrever_audio(url, tmp)
+            tempos["whisper"] = time.perf_counter() - t0
             origem = f"whisper {MODELO_WHISPER}"
 
         if not segmentos:
@@ -730,7 +882,11 @@ def processar(url: str, forcar: bool) -> str:
         transcricao = montar_transcricao(segmentos)
         print(f"  transcricao com {len(transcricao):,} caracteres")
 
+        t0 = time.perf_counter()
         nota, formato = gerar_nota(meta, transcricao, contexto_da_base())
+        tempos["analise"] = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
         caminho = salvar(
             meta,
             nota,
@@ -739,30 +895,51 @@ def processar(url: str, forcar: bool) -> str:
             {
                 "formato": formato,
                 "modelo": MODELO,
+                "motor": MOTOR,
                 "contexto": CONTEXTO,
                 "transcricao": origem,
             },
         )
+        tempos["gravacao"] = time.perf_counter() - t0
         print(f"  gravado: {caminho.name}")
+
+        total = time.perf_counter() - inicio_total
+        print(
+            "  tempo -> legenda: {legenda:.0f}s | whisper: {whisper:.0f}s | "
+            "analise: {analise:.0f}s | gravacao: {gravacao:.0f}s | total: {total:.0f}s"
+            .format(total=total, **tempos)
+        )
         return "concluido"
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
 def main():
-    global BASE_DIR, MODELO, CONTEXTO, FORMATO
+    global BASE_DIR, MOTOR, MODELO, CONTEXTO, FORMATO
     p = argparse.ArgumentParser(description="Base de conhecimento a partir de videos do YouTube")
     p.add_argument("urls", nargs="*", help="um ou mais links do YouTube")
     p.add_argument("--arquivo", help="arquivo txt com um link por linha")
     p.add_argument("--forcar", action="store_true", help="reprocessa video ja existente")
     p.add_argument("--base", default=str(BASE_DIR), help="pasta onde a base sera gravada")
-    p.add_argument("--modelo", default=MODELO, help="modelo local instalado no Ollama")
+    p.add_argument(
+        "--motor",
+        choices=("ollama", "claude"),
+        default=MOTOR,
+        help="motor de analise: 'ollama' roda local e gratis; 'claude' usa a "
+        "API da Anthropic (mais rapido, sem custo de RAM local, cobra por token)",
+    )
+    p.add_argument(
+        "--modelo",
+        default=None,
+        help="modelo do motor escolhido; padrao depende do --motor "
+        "(ollama: qwen3.5:9b / claude: claude-haiku-4-5-20251001)",
+    )
     p.add_argument(
         "--contexto",
         type=int,
         default=0,
         help="janela em tokens; por padrao vem do modelo "
-        "(4b=8192, 9b=16384, 27b=32768)",
+        "(4b=8192, 9b=16384, 27b=32768; modelos Claude usam 190000)",
     )
     p.add_argument(
         "--formato",
@@ -774,7 +951,8 @@ def main():
     args = p.parse_args()
 
     BASE_DIR = Path(args.base).expanduser()
-    MODELO = args.modelo
+    MOTOR = args.motor
+    MODELO = args.modelo or MODELO_PADRAO_POR_MOTOR.get(MOTOR, "qwen3.5:9b")
     CONTEXTO = args.contexto or int(
         os.environ.get("YTBASE_CTX") or contexto_do_modelo(MODELO)
     )
@@ -794,10 +972,16 @@ def main():
         sys.exit(1)
 
     print(f"Base: {BASE_DIR}")
-    print(
-        f"Modelo local: {MODELO} (janela de {CONTEXTO:,} tokens, "
-        f"resposta ate {resposta_max():,})"
-    )
+    if MOTOR == "claude":
+        print(
+            f"Motor: Claude API ({MODELO}, contexto {CONTEXTO:,} tokens, "
+            f"resposta ate {resposta_max():,})"
+        )
+    else:
+        print(
+            f"Motor: Ollama local ({MODELO}, janela de {CONTEXTO:,} tokens, "
+            f"resposta ate {resposta_max():,})"
+        )
 
     alvos = []
     for url in urls:
@@ -821,6 +1005,10 @@ def main():
     if BASE_DIR.exists():
         reconstruir_indice()
         print(f"\nIndice atualizado: {BASE_DIR / '_indice.md'}")
+
+    if concluidos and MOTOR == "ollama":
+        descarregar_modelo_ollama()
+        print("Modelo Ollama liberado da memoria.")
 
     partes = [f"{concluidos} concluido(s)"]
     if ignorados:
