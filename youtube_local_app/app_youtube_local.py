@@ -16,20 +16,7 @@ PASTA_APP = Path(__file__).resolve().parent
 SCRIPT = PASTA_APP / "base_youtube_local.py"
 PASTA_PADRAO = Path.home() / "Google Drive" / "Meu Drive" / "Base YouTube"
 CONFIG = PASTA_APP / "config.json"
-
-MODELOS_POR_MOTOR = {
-    "ollama": ("qwen3.5:4b", "qwen3.5:9b", "qwen3.5:27b"),
-    "claude": ("claude-haiku-4-5-20251001", "claude-sonnet-5", "claude-opus-5"),
-}
-CONTEXTO_POR_MODELO = {
-    "qwen3.5:4b": 8192,
-    "qwen3.5:9b": 16384,
-    "qwen3.5:27b": 32768,
-    "claude-haiku-4-5-20251001": 190000,
-    "claude-sonnet-5": 190000,
-    "claude-opus-5": 190000,
-}
-MODELOS_WHISPER = ("small", "medium")
+CONTEXTO_POR_MODELO = {"qwen3.5:4b": 8192, "qwen3.5:9b": 16384, "qwen3.5:27b": 32768}
 
 
 def ler_config() -> dict:
@@ -53,7 +40,7 @@ class Aplicativo:
         quadro = ttk.Frame(raiz, padding=18)
         quadro.pack(fill="both", expand=True)
         quadro.columnconfigure(0, weight=1)
-        quadro.rowconfigure(8, weight=1)
+        quadro.rowconfigure(7, weight=1)
 
         ttk.Label(
             quadro,
@@ -82,39 +69,25 @@ class Aplicativo:
         )
 
         opcoes = ttk.Frame(quadro)
-        opcoes.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(0, 8))
-        ttk.Label(opcoes, text="Motor:").pack(side="left")
-        self.motor = tk.StringVar(value=self.cfg.get("motor", "ollama"))
-        caixa_motor = ttk.Combobox(
-            opcoes,
-            textvariable=self.motor,
-            values=("ollama", "claude"),
-            width=8,
-            state="readonly",
-        )
-        caixa_motor.pack(side="left", padx=(6, 14))
-        caixa_motor.bind("<<ComboboxSelected>>", self.trocar_motor)
-
+        opcoes.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(0, 12))
         ttk.Label(opcoes, text="Modelo:").pack(side="left")
-        self.modelo = tk.StringVar(
-            value=self.cfg.get("modelo") or MODELOS_POR_MOTOR[self.motor.get()][0]
-        )
-        self.caixa_modelo = ttk.Combobox(
+        self.modelo = tk.StringVar(value=self.cfg.get("modelo", "qwen3.5:9b"))
+        caixa_modelo = ttk.Combobox(
             opcoes,
             textvariable=self.modelo,
-            values=MODELOS_POR_MOTOR[self.motor.get()],
-            width=24,
+            values=tuple(CONTEXTO_POR_MODELO),
+            width=16,
             state="readonly",
         )
-        self.caixa_modelo.pack(side="left", padx=(6, 14))
-        self.caixa_modelo.bind("<<ComboboxSelected>>", self.ajustar_contexto)
+        caixa_modelo.pack(side="left", padx=(6, 14))
+        caixa_modelo.bind("<<ComboboxSelected>>", self.ajustar_contexto)
 
         ttk.Label(opcoes, text="Janela:").pack(side="left")
         self.contexto = tk.StringVar(value=self.cfg.get("contexto", ""))
         ttk.Combobox(
             opcoes,
             textvariable=self.contexto,
-            values=("", "8192", "16384", "32768", "190000"),
+            values=("", "8192", "16384", "32768"),
             width=8,
             state="readonly",
         ).pack(side="left", padx=(6, 14))
@@ -128,36 +101,16 @@ class Aplicativo:
             width=9,
             state="readonly",
         ).pack(side="left", padx=(6, 14))
-
-        opcoes2 = ttk.Frame(quadro)
-        opcoes2.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(0, 12))
-        ttk.Label(opcoes2, text="Whisper (sem legenda):").pack(side="left")
-        self.whisper = tk.StringVar(value=self.cfg.get("whisper", "small"))
-        ttk.Combobox(
-            opcoes2,
-            textvariable=self.whisper,
-            values=MODELOS_WHISPER,
-            width=8,
-            state="readonly",
-        ).pack(side="left", padx=(6, 14))
-
-        self.label_chave = ttk.Label(opcoes2, text="Chave API Claude:")
-        self.entrada_chave = ttk.Entry(opcoes2, width=28, show="*")
-        self.entrada_chave.insert(0, os.environ.get("ANTHROPIC_API_KEY", ""))
-        self.label_chave.pack(side="left")
-        self.entrada_chave.pack(side="left", padx=(6, 14))
-
         self.forcar = tk.BooleanVar(value=False)
-        ttk.Checkbutton(opcoes2, text="Refazer vídeo já processado", variable=self.forcar).pack(
+        ttk.Checkbutton(opcoes, text="Refazer vídeo já processado", variable=self.forcar).pack(
             side="left"
         )
-        self.atualizar_visibilidade_motor()
 
         self.log = tk.Text(quadro, height=15, state="disabled", wrap="word")
-        self.log.grid(row=8, column=0, columnspan=3, sticky="nsew")
+        self.log.grid(row=7, column=0, columnspan=3, sticky="nsew")
 
         botoes = ttk.Frame(quadro)
-        botoes.grid(row=9, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+        botoes.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(12, 0))
         ttk.Button(botoes, text="Verificar instalação", command=self.verificar).pack(side="left")
         self.botao_processar = ttk.Button(
             botoes, text="Processar vídeos", command=self.processar
@@ -171,27 +124,8 @@ class Aplicativo:
         self.raiz.after(100, self.consumir_eventos)
 
     def ajustar_contexto(self, _evento=None):
-        """A janela acompanha o modelo: 4b nao aguenta a janela do 27b, e um
-        modelo Claude usa uma janela bem maior que qualquer modelo local."""
+        """A janela acompanha o modelo: 4b nao aguenta a janela do 27b."""
         self.contexto.set(str(CONTEXTO_POR_MODELO.get(self.modelo.get(), 16384)))
-
-    def trocar_motor(self, _evento=None):
-        """Ao trocar o motor, a lista de modelos e a janela mudam junto, e o
-        campo da chave de API so faz sentido para o motor Claude."""
-        valores = MODELOS_POR_MOTOR[self.motor.get()]
-        self.caixa_modelo.configure(values=valores)
-        if self.modelo.get() not in valores:
-            self.modelo.set(valores[0])
-        self.ajustar_contexto()
-        self.atualizar_visibilidade_motor()
-
-    def atualizar_visibilidade_motor(self):
-        if self.motor.get() == "claude":
-            self.label_chave.pack(side="left")
-            self.entrada_chave.pack(side="left", padx=(6, 14))
-        else:
-            self.label_chave.pack_forget()
-            self.entrada_chave.pack_forget()
 
     def salvar_config(self):
         try:
@@ -199,15 +133,9 @@ class Aplicativo:
                 json.dumps(
                     {
                         "pasta": self.pasta.get(),
-                        "motor": self.motor.get(),
                         "modelo": self.modelo.get(),
                         "contexto": self.contexto.get(),
                         "formato": self.formato.get(),
-                        "whisper": self.whisper.get(),
-                        # A chave de API NAO e salva em disco de proposito:
-                        # config.json fica em texto puro na pasta do app.
-                        # Defina ANTHROPIC_API_KEY no sistema para nao ter
-                        # que colar a chave a cada abertura do programa.
                     },
                     ensure_ascii=False,
                     indent=2,
@@ -250,8 +178,6 @@ class Aplicativo:
             str(SCRIPT),
             "--base",
             self.pasta.get(),
-            "--motor",
-            self.motor.get(),
             "--modelo",
             self.modelo.get(),
             "--formato",
@@ -290,10 +216,6 @@ class Aplicativo:
             # Sem UTF-8 explicito, titulo de video com acento ou emoji derruba
             # o processo filho com UnicodeEncodeError no console do Windows.
             ambiente = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
-            ambiente["YTBASE_WHISPER"] = self.whisper.get()
-            chave = self.entrada_chave.get().strip()
-            if chave:
-                ambiente["ANTHROPIC_API_KEY"] = chave
             self.processo = processo = subprocess.Popen(
                 comando,
                 cwd=PASTA_APP,
